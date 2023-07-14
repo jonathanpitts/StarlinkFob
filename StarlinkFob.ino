@@ -12,6 +12,7 @@ bool buttonA = false;
 bool buttonB = false;
 
 // Display variables
+int displayMode = 0;  // 0: voltage, ping, 1: SSID
 char statusMsg[50];
 bool haltDisplayUpdate = false;
 
@@ -21,6 +22,8 @@ int64_t nextSecondTime;
 const int initialPoweroffTime = 120;
 const int longPoweroffTime = 300;
 int poweroffTimer = initialPoweroffTime;
+const int cancelDelaySec = 60;
+int cancelTimer = cancelDelaySec;
 
 // Network variables
 bool wifiScanned = false;
@@ -35,7 +38,8 @@ const int udpPort = 6970;
 
 IPAddress linkyM5IP(192, 168, 8, 10);
 IPAddress linkyIP(192, 168, 100, 1);
-IPAddress gateway(192, 168, 8, 1);
+IPAddress linkyRouterIP(192, 168, 8, 1);
+IPAddress rvRouterIP(192, 168, 12, 1);
 IPAddress subnet(255, 255, 255, 0);
 IPAddress primaryDNS(8, 8, 8, 8);   // optional
 IPAddress secondaryDNS(8, 8, 4, 4); // optional
@@ -48,17 +52,25 @@ struct PingTarget {
   bool pinged;  // Have sent a ping to this host
   bool pingOK;  // result of ping
 };
-PingTarget linkyRouter = {.displayHostname="linkyRouter", .useIP=true, .pingIP=gateway, .pinged=false, .pingOK=false};
+PingTarget rvRouter = {.displayHostname="rvRouter", .useIP=true, .pingIP=rvRouterIP, .pinged=false, .pingOK=false};
+PingTarget linkyRouter = {.displayHostname="linkyRouter", .useIP=true, .pingIP=linkyRouterIP, .pinged=false, .pingOK=false};
 PingTarget linkyM5 = {.displayHostname="linkyM5stick", .useIP=true, .pingIP=linkyM5IP, .pinged=false, .pingOK=false};
 PingTarget linky = {.displayHostname="linky", .useIP=true, .pingIP=linkyIP, .pinged=false, .pingOK=false};
 PingTarget dns = {.displayHostname="DNS server", .useIP=true, .pingIP=primaryDNS, .pinged=false, .pingOK=false};
 PingTarget google = {.displayHostname="google", .useIP=false, .fqn="www.google.com", .pinged=false, .pingOK=false};
 
-PingTarget* pingTargetArray[] = {&linkyRouter, &linkyM5, &linky, &dns, &google};
+PingTarget* pingTargetArray[] = {&rvRouter, &linkyRouter, &linkyM5, &linky, &dns, &google};
 int pingTargetArrayLen = sizeof(pingTargetArray) / sizeof(&linkyRouter);
 int pingTargetNum = 0;
 
 AsyncUDP udp;
+
+// EEPROM variables
+#define SSID_ADDR 0
+#define EEPROM_SIZE 10  // define the size of EEPROM(Byte).
+
+uint8_t configuredSSIDIndex;
+String configuredNetwork;
 
 String chooseNetwork()
 {
@@ -85,8 +97,12 @@ String chooseNetwork()
       Serial.printf("%2d",i + 1);
       Serial.print(" | ");
       Serial.printf("%-32.32s\n", SSID.c_str());
-      if (!SSID.compareTo("129Linky"))
-        chosenNetwork = SSID;
+      // check if the configured network was found in the scan
+      if (!SSID.compareTo(configuredNetwork))
+      {
+        chosenNetwork = configuredNetwork;
+        break;
+      }
     }
   }
 
@@ -129,7 +145,8 @@ bool connectWifi()
     // polled until wifi connects
     if (WiFi.status() != WL_CONNECTED)
     {
-      displayStatus("connecting");
+      sprintf(statusMsg, "connecting");
+      displayStatus();
       return false;
     }
     wifiConnected = true;
@@ -153,6 +170,7 @@ bool connectWifi()
         bool verbose = false;
         if (verbose)
         {
+          // print each received msg for debug
           Serial.print("Received packet from ");
           Serial.print(packet.remoteIP());
           Serial.print(", Length: ");
@@ -161,7 +179,16 @@ bool connectWifi()
           Serial.write(packet.data(), packet.length());
           Serial.println();
         }
-        displayStatus((char*)packet.data());
+
+        // save recceived msg into statusMsg
+        int i;
+        uint8_t *msg_p = packet.data();
+        for(i=0; i<packet.length(); i++)
+        {
+          statusMsg[i] = static_cast<char>(*msg_p++);
+        }
+        statusMsg[i] = '\0';
+        displayStatus();
       });
       udpListening = true;
       M5.Lcd.setTextColor(TFT_WHITE,TFT_BLACK);
@@ -170,13 +197,13 @@ bool connectWifi()
   return true;
 }
 
-void displayStatus(String msg)
+void displayStatus()
 {
   if (haltDisplayUpdate)
     return;
   M5.Lcd.fillScreen(BLACK);
   M5.Lcd.setCursor(0, 0, 2);
-  M5.Lcd.print(msg.c_str());
+  M5.Lcd.print(statusMsg);
   displayPing();
 }
 
@@ -198,6 +225,8 @@ void displayPing()
   if (haltDisplayUpdate)
     return;
   M5.Lcd.setCursor(0, 80, 2);
+  M5.Lcd.println("");
+  M5.Lcd.setCursor(0, 80, 2);
   if (!wifiConnected)
   {
     M5.Lcd.println("No Wifi");
@@ -208,9 +237,41 @@ void displayPing()
     if (pingTarget_p->pinged)
     {
       // only print ping result if we've actually pinged the host
-      M5.Lcd.printf("%s: %s", pingTarget_p->displayHostname.c_str(), pingTarget_p->pingOK?"OK":"FAIL");
+      M5.Lcd.printf("%s: %s\n", pingTarget_p->displayHostname.c_str(), pingTarget_p->pingOK?"OK":"FAIL");
     }
   }
+}
+
+void displayBattPing()
+{
+
+}
+
+void displayCancel()
+{
+
+}
+
+void displaySsid()
+{
+
+}
+
+void updateDisplay()
+{
+  M5.Lcd.fillScreen(BLACK);
+
+  if (displayMode == 0)
+  {
+    displayBattPing();
+  }
+  else if (displayMode == 1)
+    displayCancel();
+  else if (displayMode == 2)
+    displaySsid();
+  else
+    displayMode = 0;  // should never get here
+
 }
 
 void secondsUpdate()
@@ -228,29 +289,38 @@ void secondsUpdate()
   }
   else
   {
-    // power off after timeout
-    const int cancelDelaySec = 5;
+    // poweroffTimer has expired, do shutdown/cancel processing
+
+    // display shutdown message for cancelDelaySec seconds
     haltDisplayUpdate = true;
     M5.Lcd.fillScreen(BLACK);
     M5.Lcd.setCursor(0, 0, 2);
     M5.Lcd.println("Shutting Down!!!\nPress button\nto cancel");
 
-    for (int i=0; i<(cancelDelaySec * 10); i++)
+    // power off after cancelTimer timeout with no ButtonA pushed
+    if (cancelTimer > 0)
     {
-      delay(100);
-      M5.update();
-      if (M5.BtnA.wasReleased())
+      if (buttonA)
       {
-        displayStatus("cancelled");
-        delay(2000);
+        Serial.println("shutdown cancelled");
+        buttonA = false;
         poweroffTimer = longPoweroffTime;
         haltDisplayUpdate = false;
+        cancelTimer = cancelDelaySec;
         return;
       }
+      else
+      {
+        --cancelTimer;
+      }
+      return;
     }
-    Serial.println("Shutdown after timeout");
-    M5.Axp.PowerOff();
-    // never reached
+    else
+    {
+      Serial.println("Shutdown after timeout");
+      M5.Axp.PowerOff();
+      // never reached
+    }
   }
 
   // Ping hosts and display live-ness
@@ -266,6 +336,9 @@ void secondsUpdate()
     }
     displayPing();
   }
+
+  // update the LCD display once/sec, blank it & hand off to display functions
+  // updateDisplay();
 
   if (buttonA)  // Linky power toggle button
   {
@@ -288,7 +361,8 @@ void setup() {
   M5.Lcd.setRotation(1);
   M5.Lcd.setTextSize(2);
   M5.Lcd.setTextColor(TFT_RED,TFT_BLACK);
-  displayStatus("starting");
+  sprintf(statusMsg, "starting");
+  displayStatus();
   M5.update();
 
   Serial.begin(115200);
@@ -297,6 +371,27 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   delay(100);
+
+  // Initialize EEPROM
+  while (!EEPROM.begin(EEPROM_SIZE)) {  // Request storage of SIZE size(success return)
+    Serial.println("\nFailed to initialise EEPROM!");
+    M5.Lcd.println("EEPROM Fail");
+    delay(1000000);
+  }
+
+  // Initialize variables from EEPROM
+  configuredSSIDIndex = EEPROM.read(SSID_ADDR);
+  if (configuredSSIDIndex == 0)
+    configuredNetwork = "129Linky";
+  else if (configuredSSIDIndex == 1)
+    configuredNetwork = "129LinkyRv";
+  else
+    configuredNetwork = "unconfiguredNetwork";
+
+  // FIXME
+  configuredNetwork = "129Linky";
+
+  Serial.printf("configured SSID index: %d SSID: %s\n", configuredSSIDIndex, configuredNetwork);
 
   // initialize time
   int64_t now = esp_timer_get_time();
@@ -313,6 +408,19 @@ void loop() {
   if (M5.BtnB.wasReleased())
   {
     buttonB = true;
+  }
+
+  // Small button cycles through display mode & time set fields
+  if (buttonB)
+  {
+    if (displayMode == 0)
+      displayMode = 1;
+    else if (displayMode == 1)
+      displayMode = 2;
+    else
+      displayMode = 0;
+    
+    buttonB = false;
   }
 
   // Check if it's time to increment the seconds-counter
