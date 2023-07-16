@@ -60,6 +60,7 @@ PingTarget linky = {.displayHostname="linky", .useIP=true, .pingIP=linkyIP, .pin
 PingTarget dns = {.displayHostname="DNS server", .useIP=true, .pingIP=primaryDNS, .pinged=false, .pingOK=false};
 PingTarget google = {.displayHostname="google", .useIP=false, .fqn="www.google.com", .pinged=false, .pingOK=false};
 
+// Poor design :-( Order of ping targets in array is important, coupled to skipping rvRouter in local mode
 PingTarget* pingTargetArray[] = {&rvRouter, &linkyRouter, &linkyM5, &linky, &dns, &google};
 int pingTargetArrayLen = sizeof(pingTargetArray) / sizeof(&linkyRouter);
 int pingTargetNum = 0;
@@ -70,7 +71,7 @@ AsyncUDP udp;
 #define SSID_ADDR 0
 #define EEPROM_SIZE 10  // define the size of EEPROM(Byte).
 
-uint8_t configuredSSIDIndex; // 0: Remote, 1: Local
+uint8_t localMode; // 0: Remote, 1: Local
 
 bool chooseNetwork()
 {
@@ -257,21 +258,21 @@ void displayStatus2()
 void displaySsid()
 {
   M5.Lcd.setCursor(0, 0, 1);
-  M5.Lcd.printf("%s SSID: %s\nM5: toggle SSID", configuredSSIDIndex?"Local":"Remote", configuredSSID);
+  M5.Lcd.printf("%s SSID: %s\nM5: local/remote", localMode?"Local":"Remote", configuredSSID);
   if (buttonA)
   {
-    if (configuredSSIDIndex == 0)
+    if (localMode == 0)
     {
-      configuredSSIDIndex = 1;
+      localMode = 1;
     }
     else
     {
-      configuredSSIDIndex = 0;
+      localMode = 0;
     }
-    EEPROM.write(SSID_ADDR, (uint8_t) configuredSSIDIndex);
+    EEPROM.write(SSID_ADDR, (uint8_t) localMode);
     EEPROM.commit();
     buttonA = 0;
-    Serial.printf("Toggled SSID index to %d, restarting...\n", configuredSSIDIndex);
+    Serial.printf("Toggled localMode to %d, restarting...\n", localMode);
     ESP.restart();
   }
 }
@@ -351,7 +352,14 @@ void secondsUpdate()
     if (!(secondsSinceStart%pingPeriod))
     {
       if (++pingTargetNum == pingTargetArrayLen)
-        pingTargetNum = 0;
+      {
+        // Skip pinging rvRouter if local mode
+        // Poor design: coupled to order of ping target array
+        if (localMode == 0)
+          pingTargetNum = 0;
+        else
+          pingTargetNum = 1;
+      }
 
       doPing(pingTargetNum);
     }
@@ -390,8 +398,8 @@ void setup() {
   }
 
   // Initialize variables from EEPROM
-  configuredSSIDIndex = EEPROM.read(SSID_ADDR);
-  if (configuredSSIDIndex == 0)
+  localMode = EEPROM.read(SSID_ADDR);
+  if (localMode == 0)
   {
     strncpy(configuredSSID, WIFI_REMOTE_SSID, maxSSIDLen);
     strncpy(configuredSSIDPwd, WIFI_REMOTE_PASSWORD, maxSSIDLen);
@@ -402,7 +410,7 @@ void setup() {
     strncpy(configuredSSIDPwd, WIFI_LOCAL_PASSWORD, maxSSIDLen);
   }
 
-  Serial.printf("configured SSID index: %d SSID: %s\n", configuredSSIDIndex, configuredSSID);
+  Serial.printf("configured SSID index: %d SSID: %s\n", localMode, configuredSSID);
 
   // initialize time
   int64_t now = esp_timer_get_time();
