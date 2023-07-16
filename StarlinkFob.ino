@@ -118,6 +118,7 @@ bool connectWifi()
     if (!chooseNetwork())
     {
       // didn't find configured network
+      Serial.println("Didn't find configured network");
       return false;
     }
     else
@@ -293,7 +294,9 @@ void updateDisplay()
 
 void secondsUpdate()
 {
-  bool rv;
+  // update the LCD display once/sec
+  updateDisplay();
+
   // Check if we're connected to Wifi yet
   if (!wifiSetupComplete)
   {
@@ -354,9 +357,6 @@ void secondsUpdate()
     }
   }
 
-  // update the LCD display once/sec
-  updateDisplay();
-
   if (wifiSetupComplete)
   {
     // Serial.println("Writing status request to linkyM5");
@@ -374,7 +374,6 @@ void setup() {
   M5.update();
 
   sprintf(statusMsg, "starting");
-  updateDisplay();
 
   Serial.begin(115200);
 
