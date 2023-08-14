@@ -6,9 +6,14 @@
 #include <EEPROM.h>
 #include <ESP32Ping.h>
 
+// global enums
+enum ButtonName {BUTTON_M5, BUTTON_B};
+enum PressType {SHORT_PRESS, LONG_PRESS};
 
 // button variables
 bool buttonA = false;
+bool buttonALong = false;
+int64_t buttonADownTime;
 bool buttonB = false;
 
 // Display variables
@@ -27,10 +32,6 @@ int cancelTimer = cancelDelaySec;
 const int pingPeriod = 4;
 
 // Network variables
-bool wifiScanned = false;
-bool wifiConnecting = false;
-bool wifiConnected = false;
-bool udpListening = false;
 bool wifiSetupComplete = false;
 const int maxSSIDLen = 65;
 char configuredSSID[maxSSIDLen];
@@ -73,129 +74,6 @@ AsyncUDP udp;
 
 uint8_t localMode; // 0: Remote, 1: Local
 
-bool chooseNetwork()
-{
-  Serial.println("Scan start");
-
-  // WiFi.scanNetworks will return the number of networks found.
-  int n = WiFi.scanNetworks();
-  Serial.println("Scan done");
-  if (n == 0)
-  {
-    Serial.println("no networks found");
-    return(false);
-  }
-  else
-  {
-    Serial.print(n);
-    Serial.println(" networks found");
-    Serial.println("Nr | SSID");
-    for (int i = 0; i < n; ++i)
-    {
-      String SSID = WiFi.SSID(i);
-      // Print SSID for each network found
-      Serial.printf("%2d",i + 1);
-      Serial.print(" | ");
-      Serial.printf("%-32.32s\n", SSID.c_str());
-      // check if the configured network was found in the scan
-      if (!strncmp(SSID.c_str(), configuredSSID, maxSSIDLen))
-      {
-        Serial.printf("Found configured SSID %s\n", configuredSSID);
-        return true;
-      }
-    }
-  }
-
-  // Delete the scan result to free memory
-  WiFi.scanDelete();
-
-  return false;
-}
-
-bool connectWifi()
-{
-  if (!wifiScanned)
-  {
-    if (!chooseNetwork())
-    {
-      // didn't find configured network
-      Serial.println("Didn't find configured network");
-      return false;
-    }
-    else
-    {
-      Serial.print("connecting to network: ");
-      Serial.print(configuredSSID);
-      Serial.print(" with passwd: ");
-      Serial.println(configuredSSIDPwd);
-      wifiScanned = true;
-    }
-  }
-
-  if (!wifiConnecting)
-  {
-    Serial.println("working on setting up networking");
-    // runs once
-    WiFi.begin(configuredSSID, configuredSSIDPwd);
-    wifiConnecting = true;
-    return false;
-  }
-
-  if (!wifiConnected)
-  {
-    // polled until wifi connects
-    if (WiFi.status() != WL_CONNECTED)
-    {
-      sprintf(statusMsg, "connecting");
-      return false;
-    }
-    wifiConnected = true;
-    M5.Lcd.setTextColor(TFT_YELLOW,TFT_BLACK);
-    Serial.print("connected to wifi with IP: ");
-    Serial.println(WiFi.localIP());
-    return false;
-  }
-
-  if (!udpListening)
-  {
-    // set up lambda to call on receipt of a udp packet
-    Serial.println("Setting up UDP server");
-    if (udp.listen(udpPort))
-    {
-      Serial.print("UDP listening on port ");
-      Serial.println(udpPort);
-      udp.onPacket([](AsyncUDPPacket packet)
-      {
-        // this is a bloody lambda!
-        bool verbose = false;
-        if (verbose)
-        {
-          // print each received msg for debug
-          Serial.print("Received packet from ");
-          Serial.print(packet.remoteIP());
-          Serial.print(", Length: ");
-          Serial.print(packet.length());
-          Serial.print(", Data: ");
-          Serial.write(packet.data(), packet.length());
-          Serial.println();
-        }
-
-        // save received msg into statusMsg
-        int i;
-        uint8_t *msg_p = packet.data();
-        for(i=0; i<packet.length(); i++)
-        {
-          statusMsg[i] = static_cast<char>(*msg_p++);
-        }
-        statusMsg[i] = '\0';
-      });
-      udpListening = true;
-      M5.Lcd.setTextColor(TFT_WHITE,TFT_BLACK);
-    }
-  }
-  return true;
-}
-
 void doPing(int pingTargetId)
 {
   PingTarget* pingTarget_p = pingTargetArray[pingTargetId];
@@ -212,7 +90,7 @@ void doPing(int pingTargetId)
 
 void displayPing(int pingTargetId)
 {
-  if (haltDisplayUpdate || !wifiConnected)
+  if (haltDisplayUpdate || !wifiSetupComplete)
     return;
 
   PingTarget* pingTarget_p = pingTargetArray[pingTargetId];
@@ -236,23 +114,11 @@ void displayStatus()
   if (wifiSetupComplete)
   {
     displayPing(pingTargetNum);
-    if (buttonA)  // Linky power toggle button
-    {
-      udp.writeTo((uint8_t*)"toggle", 6, linkyM5IP, udpPort);
-      buttonA = false;
-      Serial.println("ButtonA toggled power");
-    }
   }
   else
   {
     M5.Lcd.println("No Wifi");
   }
-}
-
-void displayStatus2()
-{
-  M5.Lcd.setCursor(0, 0, 2);
-  M5.Lcd.println("Not Implemented");
 }
 
 void displaySsid()
@@ -277,33 +143,8 @@ void displaySsid()
   }
 }
 
-// blank LCD display & hand off to display functions
-void updateDisplay()
-{
-  M5.Lcd.fillScreen(BLACK);
-
-  if (displayMode == 0)
-    displayStatus();
-  else if (displayMode == 1)
-    displayStatus2();
-  else if (displayMode == 2)
-    displaySsid();
-  else
-    displayMode = 0;  // should never get here
-
-}
-
 void secondsUpdate()
 {
-  // update the LCD display once/sec
-  updateDisplay();
-
-  // Check if we're connected to Wifi yet
-  if (!wifiSetupComplete)
-  {
-    wifiSetupComplete = connectWifi();
-  }
-
   // do power-off timer processing
   if (poweroffTimer > 0)
   {
@@ -365,13 +206,297 @@ void secondsUpdate()
     }
   }
 
-  if (wifiSetupComplete)
+}
+
+class WifiInitSm
+{
+public:
+  enum WifiStateName {SCAN, CONNECTING, UDP, WIFI_DONE};  // SSID choice state names
+
+  WifiInitSm()
   {
-    // Serial.println("Writing status request to linkyM5");
-    udp.writeTo((uint8_t*)"status", 6, linkyM5IP, udpPort);
+    currentState = SCAN;
+    nextState = SCAN;
   }
 
+  //! @return true: advance super SM, false: no state change
+  bool tick()
+  {
+    currentState = nextState;
+    Serial.printf("In WifiInitSm state %s\n", stateNamesArray[currentState]);
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setCursor(0, 0, 2);
+    M5.Lcd.printf("%s\n", stateNamesArray[currentState]);
+
+    switch(currentState)
+    {
+      case SCAN:
+        if (chooseNetwork())
+        {
+          Serial.print("connecting to network: ");
+          Serial.print(configuredSSID);
+          Serial.print(" with passwd: ");
+          Serial.println(configuredSSIDPwd);
+          WiFi.begin(configuredSSID, configuredSSIDPwd);
+          nextState = CONNECTING;
+        }
+        else
+        {
+          Serial.println("Didn't find configured network");
+        }
+        break;
+      case CONNECTING:
+        // polled until wifi connects
+        if (WiFi.status() != WL_CONNECTED)
+        {
+          break;
+        }
+        Serial.print("connected to wifi with IP: ");
+        Serial.println(WiFi.localIP());
+        nextState = UDP;
+        break;
+      case UDP:
+        // set up lambda to call on receipt of a udp packet
+        Serial.println("Setting up UDP server");
+        if (udp.listen(udpPort))
+        {
+          Serial.print("UDP listening on port ");
+          Serial.println(udpPort);
+
+          udp.onPacket([](AsyncUDPPacket packet)
+          {
+            // this is a bloody lambda!
+            bool verbose = false;
+            if (verbose)
+            {
+              // print each received msg for debug
+              Serial.print("Received packet from ");
+              Serial.print(packet.remoteIP());
+              Serial.print(", Length: ");
+              Serial.print(packet.length());
+              Serial.print(", Data: ");
+              Serial.write(packet.data(), packet.length());
+              Serial.println();
+            }
+
+            // save received msg into statusMsg
+            int i;
+            uint8_t *msg_p = packet.data();
+            for(i=0; i<packet.length(); i++)
+            {
+              statusMsg[i] = static_cast<char>(*msg_p++);
+            }
+            statusMsg[i] = '\0';
+          });
+        }
+        nextState = WIFI_DONE;
+        break;
+      case WIFI_DONE:
+        M5.Lcd.setTextColor(TFT_WHITE,TFT_BLACK);
+        wifiSetupComplete = true;
+        return true;  // advance superSm
+      default:
+        nextState = SCAN; // should never get here
+    }
+    return false;
+  }
+
+  //! @return true: advance super SM, false: no state change
+  bool buttonPress(ButtonName buttonName, PressType pressType)
+  {
+    Serial.println("CANCELLING WIFI"); 
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setCursor(0, 0, 2);
+    M5.Lcd.println("CANCELLING WIFI"); 
+    return true; 
+  } 
+private:
+  WifiStateName currentState;
+  WifiStateName nextState;
+  String stateNamesArray[4] = {"SCAN", "CONNECTING", "UDP", "WIFI_DONE"};
+
+  bool chooseNetwork()
+  {
+    Serial.println("Scan start");
+
+    // WiFi.scanNetworks will return the number of networks found.
+    int n = WiFi.scanNetworks();
+    Serial.println("Scan done");
+    if (n == 0)
+    {
+      Serial.println("no networks found");
+      return(false);
+    }
+    else
+    {
+      Serial.print(n);
+      Serial.println(" networks found");
+      Serial.println("Nr | SSID");
+      for (int i = 0; i < n; ++i)
+      {
+        String SSID = WiFi.SSID(i);
+        // Print SSID for each network found
+        Serial.printf("%2d",i + 1);
+        Serial.print(" | ");
+        Serial.printf("%-32.32s\n", SSID.c_str());
+        // check if the configured network was found in the scan
+        if (!strncmp(SSID.c_str(), configuredSSID, maxSSIDLen))
+        {
+          Serial.printf("Found configured SSID %s\n", configuredSSID);
+          return true;
+        }
+      }
+    }
+
+    // Delete the scan result to free memory
+    WiFi.scanDelete();
+
+    return false;
+  }
+
+};
+
+class SsidSm
+{
+public:
+  enum SsidStateName {SCAN, CHOOSE};  // SSID choice state names
+
+  SsidSm()
+  {
+    currentState = SCAN;
+    nextState = SCAN;
+  }
+
+  //! @return true: advance super SM, false: no state change
+  bool buttonPress(ButtonName buttonName, PressType pressType)
+  {
+    return false;
+  }
+
+private:
+  SsidStateName currentState;
+  SsidStateName nextState;
+  String stateNamesArray[2] = {"SCAN", "CHOOSE"};
+};
+
+class FobSuperSm
+{
+public:
+  enum SuperStateName {WIFI_INIT, SYS_STATUS, SHUTDOWN, SSID, PASSWD, FACTORY}; // Superstate state names
+
+  FobSuperSm()
+  {
+    currentState = WIFI_INIT;
+    nextState = WIFI_INIT;
+  }
+
+  void buttonPress(ButtonName buttonName, PressType pressType)
+  {
+    bool rv;
+    Serial.printf("FobSuperSm button press name %d type %d in state %s\n"
+                  , buttonName, pressType, stateNamesArray[currentState].c_str());
+    switch (currentState)
+    {
+      case WIFI_INIT:
+        rv = wifiInitSm.buttonPress(buttonName, pressType);
+        if (rv)
+        {
+          nextState = SYS_STATUS;
+        }
+        break;
+      case SYS_STATUS:
+        rv = statusButton(buttonName, pressType);
+        Serial.printf("button push in FobSuperSm returned %d\n", rv);
+        if (rv)
+        {
+          nextState = SSID;
+          Serial.printf("FobSuperSm new state: %s\n", stateNamesArray[nextState].c_str());
+        }
+        break;
+      case SSID:
+          nextState = SYS_STATUS;
+          Serial.printf("FobSuperSm new state: %s\n", stateNamesArray[nextState].c_str());
+        break;
+      default:
+        nextState = SYS_STATUS;
+    }
+  }
+
+  void tick()
+  {
+    bool rv;
+    currentState = nextState;
+    switch (currentState)
+    {
+      case WIFI_INIT:
+        rv = wifiInitSm.tick();
+        if (rv)
+          nextState = SYS_STATUS;
+        break;
+      case SYS_STATUS:
+        M5.Lcd.fillScreen(BLACK);
+        M5.Lcd.setCursor(0, 0, 2);
+        if (wifiSetupComplete)
+        {
+          // Serial.println("Writing status request to linkyM5");
+          udp.writeTo((uint8_t*)"status", 6, linkyM5IP, udpPort);
+        }
+        displayStatus();
+        break;
+      case SSID:
+        M5.Lcd.fillScreen(BLACK);
+        M5.Lcd.setCursor(0, 0, 2);
+        M5.Lcd.println("SSID: ");
+        break;
+      default:
+        currentState = SYS_STATUS;
+    }
+  }
+
+private:
+  SuperStateName currentState;
+  SuperStateName nextState;
+  String stateNamesArray[6] = {"WIFI_INIT", "SYS_STATUS", "SHUTDOWN", "SSID", "PASSWD", "FACTORY"};
+
+  bool statusButton(ButtonName buttonName, PressType pressType);
+
+  WifiInitSm wifiInitSm = WifiInitSm();
+  SsidSm ssidSm = SsidSm();
+};
+
+//! @return true: advance super SM, false: no state change
+bool
+FobSuperSm::statusButton(ButtonName buttonName, PressType pressType)
+{
+  Serial.printf("statusButton button press name %d type %d\n", buttonName, pressType);
+  if (BUTTON_B == buttonName)
+  {
+    Serial.println("Ignoring button B press");
+    return false;
+  }
+  if (BUTTON_M5 == buttonName)
+  {
+    if (LONG_PRESS == pressType)
+    {
+      Serial.println("Toggle power button press");
+      M5.Lcd.fillScreen(BLACK);
+      M5.Lcd.setCursor(0, 0, 2);
+      M5.Lcd.println("TOGGLING POWER");
+      udp.writeTo((uint8_t*)"toggle", 6, linkyM5IP, udpPort);
+      delay(1000);
+      return false;
+    }
+    else
+    {
+      Serial.print("statusButton short button press in state ");
+      Serial.println(stateNamesArray[currentState]);
+      return true;  // advance to next state
+    }
+  }
 }
+
+FobSuperSm fobSuperSm = FobSuperSm();
+
 
 void setup() {
   // initialize M5StickC
@@ -418,38 +543,60 @@ void setup() {
 }
 
 void loop() {
+  int64_t now_us;
+
   // Read buttons
   M5.update();
-  if (M5.BtnA.wasReleased())
+
+  if (M5.BtnA.wasPressed())
   {
+    // Initial depression of M5 was detected
+    buttonADownTime = esp_timer_get_time();
     buttonA = true;
   }
+
+  if (M5.BtnA.isPressed() && buttonA && !buttonALong)
+  {
+    // M5 button was pressed and is still pressed, check downtime
+    int64_t buttonADuration = esp_timer_get_time() - buttonADownTime;
+    if (buttonADuration > 1000000)
+    {
+      Serial.printf("long buttonA detected after %d us\n", buttonADuration);
+      buttonALong = true;
+      fobSuperSm.buttonPress(BUTTON_M5, LONG_PRESS);
+    }
+  }
+  if (M5.BtnA.wasReleased())
+  {
+    buttonA = false;
+    int64_t buttonADuration = esp_timer_get_time() - buttonADownTime;
+    if (buttonALong)
+    {
+      Serial.printf("long buttonA ended after %d us\n", buttonADuration);
+    }
+    else
+    {
+      Serial.printf("short buttonA %d us\n", buttonADuration);
+      fobSuperSm.buttonPress(BUTTON_M5, SHORT_PRESS);
+    }
+    buttonALong = false;
+  }
+
   if (M5.BtnB.wasReleased())
   {
     buttonB = true;
-  }
-
-  // Small button cycles through display mode & time set fields
-  if (buttonB)
-  {
-    if (displayMode == 0)
-      displayMode = 1;
-    else if (displayMode == 1)
-      displayMode = 2;
-    else
-      displayMode = 0;
-    
-    buttonB = false;
+    Serial.println("buttonB");
   }
 
   // Check if it's time to increment the seconds-counter
   // and process everything that should be done each second
-  int64_t now_us = esp_timer_get_time();
+  now_us = esp_timer_get_time();
   if (now_us > nextSecondTime)
   {
     secondsSinceStart++;
     nextSecondTime += 1000000;
     // Serial.printf("%lld toggleTime: %d state %d\n", secondsSinceStart, nextFlowToggleTime, generateFlowPulses);
     secondsUpdate();
+    fobSuperSm.tick();
   }
 }
