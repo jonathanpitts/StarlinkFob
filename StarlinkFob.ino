@@ -19,7 +19,6 @@ bool buttonB = false;
 // Display variables
 int displayMode = 0;  // 0: voltage, ping, 1: SSID
 char statusMsg[50];
-bool haltDisplayUpdate = false;
 
 // Time-related variables
 int64_t secondsSinceStart = 0;
@@ -90,7 +89,7 @@ void doPing(int pingTargetId)
 
 void displayPing(int pingTargetId)
 {
-  if (haltDisplayUpdate || !wifiSetupComplete)
+  if (!wifiSetupComplete)
     return;
 
   PingTarget* pingTarget_p = pingTargetArray[pingTargetId];
@@ -104,8 +103,6 @@ void displayPing(int pingTargetId)
 
 void displayStatus()
 {
-  if (haltDisplayUpdate)
-    return;
   M5.Lcd.setCursor(0, 0, 2);
   M5.Lcd.print(statusMsg);
 
@@ -145,46 +142,6 @@ void displaySsid()
 
 void secondsUpdate()
 {
-  // do power-off timer processing
-  if (poweroffTimer > 0)
-  {
-    --poweroffTimer;
-  }
-  else
-  {
-    // poweroffTimer has expired, do shutdown/cancel processing.
-    haltDisplayUpdate = true;
-    M5.Lcd.fillScreen(BLACK);
-    M5.Lcd.setCursor(0, 0, 2);
-    // Display shutdown message for cancelDelaySec seconds
-    M5.Lcd.println("Shutting Down!!!\nPress M5 button\nto cancel");
-
-    // power off after cancelTimer timeout with no ButtonA pushed
-    if (cancelTimer > 0)
-    {
-      if (buttonA)
-      {
-        Serial.println("shutdown cancelled");
-        buttonA = false;
-        poweroffTimer = longPoweroffTime;
-        haltDisplayUpdate = false;
-        cancelTimer = cancelDelaySec;
-        return;
-      }
-      else
-      {
-        --cancelTimer;
-      }
-      return;
-    }
-    else
-    {
-      Serial.println("Shutdown after timeout");
-      M5.Axp.PowerOff();
-      // never reached
-    }
-  }
-
   // Ping hosts and record live-ness
   // Note: Ping has to come before UDP send/receive or ESP32 crashes
   if (wifiSetupComplete)
@@ -356,6 +313,90 @@ private:
 
 };
 
+class ShutdownSm
+{
+public:
+  enum ShutdownStateName {TIMING, TIMEOUT};  // SSID choice state names
+
+  ShutdownSm()
+  {
+    currentState = TIMING;
+    nextState = TIMING;
+  }
+
+  //! @return true: advance super SM, false: no state change
+  bool buttonPress(ButtonName buttonName, PressType pressType)
+  {
+    switch(currentState)
+    {
+      case TIMING:
+        Serial.println("ERROR - ShutdownSm unexpected button");
+        break;
+      case TIMEOUT:
+        Serial.println("shutdown cancelled");
+        reset();
+        nextState = TIMING;
+        return true;
+    }
+    return false;
+  }
+
+  // do power-off timer processing
+  //! @return true: advance super SM, false: no state change
+  bool tick()
+  {
+    currentState = nextState;
+    switch(currentState)
+    {
+      case TIMING:
+        if (poweroffTimer > 0)
+        {
+          --poweroffTimer;
+        }
+        else
+        {
+          nextState = TIMEOUT;
+          return true;
+        }
+        break;
+      case TIMEOUT:
+        M5.Lcd.fillScreen(BLACK);
+        M5.Lcd.setCursor(0, 0, 2);
+        M5.Lcd.println("Shutting Down!!!\nPress M5 button\nto cancel");
+        // power off after cancelTimer timeout with no ButtonA pushed
+        if (cancelTimer > 0)
+        {
+          --cancelTimer;
+        }
+        else
+        {
+          Serial.println("Shutdown after timeout");
+          M5.Axp.PowerOff();
+          // never reached
+        }
+        break;
+    }
+    return false;
+  }
+
+  void reset()
+  {
+    poweroffTimer = longPoweroffTime;
+    cancelTimer = cancelDelaySec;
+  }
+
+private:
+  ShutdownStateName currentState;
+  ShutdownStateName nextState;
+  String stateNamesArray[3] = {"TIMING", "TIMEOUT"};
+
+  const int initialPoweroffTime = 120;
+  int poweroffTimer = initialPoweroffTime;
+  const int longPoweroffTime = 300;
+  const int cancelDelaySec = 60;
+  int cancelTimer = cancelDelaySec;
+};
+
 class SsidSm
 {
 public:
@@ -402,6 +443,7 @@ public:
         if (rv)
         {
           nextState = SYS_STATUS;
+          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
         }
         break;
       case SYS_STATUS:
@@ -410,12 +452,20 @@ public:
         if (rv)
         {
           nextState = SSID;
-          Serial.printf("FobSuperSm new state: %s\n", stateNamesArray[nextState].c_str());
+          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+        }
+        break;
+      case SHUTDOWN:
+        rv = shutdownSm.buttonPress(buttonName, pressType);
+        if (rv)
+        {
+          nextState = SYS_STATUS;
+          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
         }
         break;
       case SSID:
           nextState = SYS_STATUS;
-          Serial.printf("FobSuperSm new state: %s\n", stateNamesArray[nextState].c_str());
+          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
         break;
       default:
         nextState = SYS_STATUS;
@@ -431,17 +481,32 @@ public:
       case WIFI_INIT:
         rv = wifiInitSm.tick();
         if (rv)
+        {
           nextState = SYS_STATUS;
+          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+        }
         break;
       case SYS_STATUS:
         M5.Lcd.fillScreen(BLACK);
         M5.Lcd.setCursor(0, 0, 2);
+
         if (wifiSetupComplete)
         {
           // Serial.println("Writing status request to linkyM5");
           udp.writeTo((uint8_t*)"status", 6, linkyM5IP, udpPort);
         }
+
         displayStatus();
+        
+        rv = shutdownSm.tick();  // run the shutdown timer in status state
+        if (rv)
+        {
+          nextState = SHUTDOWN;
+          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+        }
+        break;
+      case SHUTDOWN:
+        shutdownSm.tick();  // run the cancel timer
         break;
       case SSID:
         M5.Lcd.fillScreen(BLACK);
@@ -461,6 +526,7 @@ private:
   bool statusButton(ButtonName buttonName, PressType pressType);
 
   WifiInitSm wifiInitSm = WifiInitSm();
+  ShutdownSm shutdownSm = ShutdownSm();
   SsidSm ssidSm = SsidSm();
 };
 
