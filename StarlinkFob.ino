@@ -5,10 +5,12 @@
 #include <string>
 #include <EEPROM.h>
 #include <ESP32Ping.h>
+#include <vector>
 
 // global enums
 enum ButtonName {BUTTON_M5, BUTTON_B};
 enum PressType {SHORT_PRESS, LONG_PRESS};
+enum LocalRemoteMode {LOCAL_MODE, REMOTE_MODE};
 
 // button variables
 bool buttonA = false;
@@ -30,12 +32,27 @@ const int cancelDelaySec = 60;
 int cancelTimer = cancelDelaySec;
 const int pingPeriod = 4;
 
+// EEPROM variables
+const uint16_t magicValue = 0xbeef;
+const int maxEpromStringLen = 32;
+LocalRemoteMode configuredMode;
+char configuredSSID[maxEpromStringLen];
+char configuredSSIDPwd[maxEpromStringLen];
+
+struct EepromConfig {
+  uint16_t magic;
+  int version;
+  LocalRemoteMode configuredMode;
+  char configuredLocalSsid[maxEpromStringLen];
+  char localPasswd[maxEpromStringLen];
+  char configuredRemoteSsid[maxEpromStringLen];
+  char remotePasswd[maxEpromStringLen];
+} eepromConfig;
+
 // Network variables
 bool wifiSetupComplete = false;
-const int maxSSIDLen = 65;
-char configuredSSID[maxSSIDLen];
-char configuredSSIDPwd[maxSSIDLen];
 const int udpPort = 6970;
+std::vector<String> ssidNames;
 
 IPAddress linkyM5IP(192, 168, 8, 10);
 IPAddress linkyIP(192, 168, 100, 1);
@@ -67,11 +84,54 @@ int pingTargetNum = 0;
 
 AsyncUDP udp;
 
-// EEPROM variables
-#define SSID_ADDR 0
-#define EEPROM_SIZE 10  // define the size of EEPROM(Byte).
+void writeEepromConfig()
+{
+  // write variables to EEPROM
+  uint8_t * eepromConfig_p = (uint8_t*)&eepromConfig;
+  for (int i=0; i<sizeof(EepromConfig); i++)
+  {
+    EEPROM.write(i, *(eepromConfig_p+i));  // write the EEPROM
+  }
+  EEPROM.commit();
 
-uint8_t localMode; // 0: Remote, 1: Local
+  M5.Lcd.fillScreen(BLACK);
+  M5.Lcd.setCursor(0, 0, 2);
+  M5.Lcd.println("REBOOTING");
+  delay(2000);
+  ESP.restart();
+}
+
+int scanSsids()
+{
+  Serial.println("Scan start");
+  ssidNames.clear();
+  WiFi.disconnect();
+
+  // WiFi.scanNetworks will return the number of networks found.
+  int n = WiFi.scanNetworks();
+  Serial.println("Scan done");
+  if (n == 0)
+    Serial.println("no networks found");
+  else if (n < 0)
+    Serial.println("Error scanning");
+  else
+  {
+    Serial.print(n);
+    Serial.println(" networks found");
+    Serial.println("Nr | SSID");
+    for (int i = 0; i < n; ++i)
+    {
+      String SSID = WiFi.SSID(i);
+      ssidNames.push_back(SSID);
+
+      // Print SSID for each network found
+      Serial.printf("%2d | %-32.32s\n", i, SSID.c_str());
+    }
+    // Delete the scan result to free memory
+    WiFi.scanDelete();
+  }
+  return n;
+}
 
 void doPing(int pingTargetId)
 {
@@ -118,28 +178,6 @@ void displayStatus()
   }
 }
 
-void displaySsid()
-{
-  M5.Lcd.setCursor(0, 0, 1);
-  M5.Lcd.printf("%s SSID: %s\nM5: local/remote", localMode?"Local":"Remote", configuredSSID);
-  if (buttonA)
-  {
-    if (localMode == 0)
-    {
-      localMode = 1;
-    }
-    else
-    {
-      localMode = 0;
-    }
-    EEPROM.write(SSID_ADDR, (uint8_t) localMode);
-    EEPROM.commit();
-    buttonA = 0;
-    Serial.printf("Toggled localMode to %d, restarting...\n", localMode);
-    ESP.restart();
-  }
-}
-
 void secondsUpdate()
 {
   // Ping hosts and record live-ness
@@ -153,7 +191,7 @@ void secondsUpdate()
       {
         // Skip pinging rvRouter if local mode
         // Poor design: coupled to order of ping target array
-        if (localMode == 0)
+        if (LOCAL_MODE == configuredMode)
           pingTargetNum = 0;
         else
           pingTargetNum = 1;
@@ -162,7 +200,6 @@ void secondsUpdate()
       doPing(pingTargetNum);
     }
   }
-
 }
 
 class WifiInitSm
@@ -183,12 +220,12 @@ public:
     Serial.printf("In WifiInitSm state %s\n", stateNamesArray[currentState]);
     M5.Lcd.fillScreen(BLACK);
     M5.Lcd.setCursor(0, 0, 2);
-    M5.Lcd.printf("%s\n", stateNamesArray[currentState]);
+    M5.Lcd.println(stateNamesArray[currentState]);
 
     switch(currentState)
     {
       case SCAN:
-        if (chooseNetwork())
+        if (findConfiguredNetwork())
         {
           Serial.print("connecting to network: ");
           Serial.print(configuredSSID);
@@ -199,7 +236,18 @@ public:
         }
         else
         {
-          Serial.println("Didn't find configured network");
+          M5.Lcd.setCursor(0, 0, 2);
+          M5.Lcd.println("M5-Long:\n  exit SCAN");
+          M5.update();
+          delay(2000);
+          if (M5.BtnA.isPressed())
+          {
+            Serial.println("CANCELLING WIFI from inside ssidSm"); 
+            M5.Lcd.fillScreen(BLACK);
+            M5.Lcd.setCursor(0, 0, 2);
+            M5.Lcd.println("CANCELLING WIFI"); 
+            return true; 
+          }
         }
         break;
       case CONNECTING:
@@ -272,45 +320,25 @@ private:
   WifiStateName nextState;
   String stateNamesArray[4] = {"SCAN", "CONNECTING", "UDP", "WIFI_DONE"};
 
-  bool chooseNetwork()
+  bool findConfiguredNetwork()
   {
-    Serial.println("Scan start");
+    int n = scanSsids();
+    if (n < 1)
+      return false;  // scan failure
 
-    // WiFi.scanNetworks will return the number of networks found.
-    int n = WiFi.scanNetworks();
-    Serial.println("Scan done");
-    if (n == 0)
+    for(auto i=ssidNames.begin(); i!=ssidNames.end(); ++i)
     {
-      Serial.println("no networks found");
-      return(false);
-    }
-    else
-    {
-      Serial.print(n);
-      Serial.println(" networks found");
-      Serial.println("Nr | SSID");
-      for (int i = 0; i < n; ++i)
+      // check if the configured network was found in the scan
+      if (!strncmp((*i).c_str(), configuredSSID, maxEpromStringLen))
       {
-        String SSID = WiFi.SSID(i);
-        // Print SSID for each network found
-        Serial.printf("%2d",i + 1);
-        Serial.print(" | ");
-        Serial.printf("%-32.32s\n", SSID.c_str());
-        // check if the configured network was found in the scan
-        if (!strncmp(SSID.c_str(), configuredSSID, maxSSIDLen))
-        {
-          Serial.printf("Found configured SSID %s\n", configuredSSID);
-          return true;
-        }
+        Serial.printf("Found configured SSID %s\n", configuredSSID);
+        return true;
       }
     }
-
-    // Delete the scan result to free memory
-    WiFi.scanDelete();
+    Serial.println("Didn't find configured network");
 
     return false;
   }
-
 };
 
 class ShutdownSm
@@ -400,76 +428,252 @@ private:
 class SsidSm
 {
 public:
-  enum SsidStateName {SCAN, CHOOSE};  // SSID choice state names
+  enum SsidStateName {IDLE, SELECT_SSID};  // SSID choice state names
+  String stateNamesArray[2] = {"IDLE", "SELECT_SSID"};  // SSID choice state names
 
   SsidSm()
   {
-    currentState = SCAN;
-    nextState = SCAN;
+    currentState = IDLE;
+    nextState = IDLE;
+    ssidMenuIndex = 0;
+  }
+
+  void tick()
+  {
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setCursor(0, 0, 2);
+
+    currentState = nextState;
+    switch(currentState)
+    {
+      case IDLE:
+        M5.Lcd.printf("SSID: %s\n",configuredSSID);
+        M5.Lcd.println("M5-long: Configure\nM5: Password");
+        break;
+      case SELECT_SSID:
+        M5.Lcd.printf("M5-long - select:\n%s\n",ssidMenu.at(ssidMenuIndex).c_str());
+        M5.Lcd.println("M5: next SSID");
+        break;
+      default:
+        nextState = IDLE;
+    }
+    return;
   }
 
   //! @return true: advance super SM, false: no state change
   bool buttonPress(ButtonName buttonName, PressType pressType)
   {
+    switch(currentState)
+    {
+      case IDLE:
+        if (BUTTON_B == buttonName)
+          return true;  // exit Sm on button B
+        if (BUTTON_M5 == buttonName)
+        {
+          if (LONG_PRESS == pressType)
+          {
+            M5.Lcd.fillScreen(BLACK);
+            M5.Lcd.setCursor(0, 0, 2);
+            M5.Lcd.println("CONFIGURE SSID\nWAIT...");
+
+            int n = scanSsids();  // scan for SSIDs
+            if (n < 1)
+            {
+              M5.Lcd.println("SCAN FAILURE");
+              delay(2000);
+              return true;
+            }
+
+            ssidMenu.clear();
+
+            for(auto i=ssidNames.begin(); i!=ssidNames.end(); ++i)
+            {
+              ssidMenu.push_back(*i);
+              Serial.printf("Pushed %s onto menu\n", (*i).c_str());
+            }
+            ssidMenu.push_back("<Exit>");
+            ssidMenuIndex = 0;
+
+            nextState = SELECT_SSID;
+            Serial.printf("%d entries in SSID menu\n", ssidMenu.size());
+            Serial.printf("ssidSm next State: %s\n", stateNamesArray[nextState]);
+          }
+          else
+            return true;  // exit SSID, advance super sm
+
+          return false;
+        }
+        break;
+      case SELECT_SSID:
+        if (BUTTON_B == buttonName)
+          break;  // ignore button B
+        if (BUTTON_M5 == buttonName)
+        {
+          if (LONG_PRESS == pressType)
+          {
+            M5.Lcd.fillScreen(BLACK);
+            M5.Lcd.setCursor(0, 0, 2);
+            M5.Lcd.printf("SELECTED SSID:\n%s", ssidMenu.at(ssidMenuIndex).c_str());
+            delay(1000);
+            if (ssidMenuIndex == ssidMenu.size())
+            {
+              nextState = IDLE;
+              return true;  // <exit> was selected
+            }
+            else
+            {
+              saveSelectedSsid(ssidMenu.at(ssidMenuIndex));  // does not return
+            }
+          }
+          else
+          {
+            ++ssidMenuIndex;
+            if (ssidMenuIndex == ssidMenu.size())
+              ssidMenuIndex = 0;
+          }
+        }
+        break;
+      default:
+        nextState = IDLE;
+    }
     return false;
   }
 
 private:
   SsidStateName currentState;
   SsidStateName nextState;
-  String stateNamesArray[2] = {"SCAN", "CHOOSE"};
+  std::vector<String> ssidMenu;
+  int ssidMenuIndex;
+
+  void saveSelectedSsid(String ssid)
+  {
+    Serial.printf("Writing SSID %s to EEPROM for mode %d\n", ssid.c_str(), configuredMode);
+    if (LOCAL_MODE == configuredMode)
+      strncpy(eepromConfig.configuredLocalSsid, ssid.c_str(), maxEpromStringLen);
+    else
+      strncpy(eepromConfig.configuredRemoteSsid, ssid.c_str(), maxEpromStringLen);
+    
+    writeEepromConfig();  // does not return
+  }
+};
+
+class PasswdSm
+{
+public:
+  enum PasswdStateName {IDLE, CHAR_CLASS, SELECT_CHAR};  // SSID choice state names
+  String stateNamesArray[3] = {"IDLE", "CHAR_CLASS", "SELECT_CHAR"};
+  enum CharClassName {LOWER, UPPER, NUMBER, SAVE, BACKSPACE};
+  const String classMenu[5] = {"lower", "UPPER", "number", "<Save>", "<Backspace>"};
+
+  PasswdSm()
+  {
+    currentState = IDLE;
+    nextState = IDLE;
+    charClass = LOWER;
+    newPasswdIndex = 0;
+    alphaIndex = 0;
+    numberIndex = 0;
+    for (int i=0; i<maxEpromStringLen; i++)
+      newPasswd[i] = 0;
+  }
+
+  void tick()
+  {
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setCursor(0, 0, 2);
+
+    currentState = nextState;
+    switch(currentState)
+    {
+      case IDLE:
+        M5.Lcd.printf("Password: %s\n",configuredSSIDPwd);
+        M5.Lcd.println("M5-long: Change\nM5: Factory Reset");
+        break;
+      case CHAR_CLASS:
+        M5.Lcd.printf("Password: %s\n", newPasswd);
+        M5.Lcd.printf("M5-long - select char type:\n%s\n",classMenu[classMenuIndex].c_str());
+        M5.Lcd.println("M5: next char type");
+        break;
+      case SELECT_CHAR:
+        switch (charClass)
+        {
+          case LOWER:
+            selectableChar = 'a' + alphaIndex;
+            break;
+          case UPPER:
+            selectableChar = 'A' + alphaIndex;
+            break;
+          case NUMBER:
+            selectableChar = '0' + numberIndex;
+            break;
+          default:
+            alphaIndex = 0;
+            numberIndex = 0;
+        }
+        M5.Lcd.printf("Password: %s\n",configuredSSIDPwd);
+        M5.Lcd.printf("M5-long - select char: %c\n",selectableChar);
+        M5.Lcd.println("M5: next char");
+        break;
+      default:
+        nextState = IDLE;
+    }
+    return;
+  }
+
+  //! @return true: advance super SM, false: no state change
+  bool buttonPress(ButtonName buttonName, PressType pressType)
+  {
+    switch (currentState)
+    {
+      case IDLE:
+        if (BUTTON_B == buttonName)
+          return true;  // exit Sm on button B
+        if (BUTTON_M5 == buttonName)
+        {
+          if (LONG_PRESS == pressType)
+          {
+            M5.Lcd.fillScreen(BLACK);
+            M5.Lcd.setCursor(0, 0, 2);
+            M5.Lcd.println("CHANGE PASSWORD");
+            delay(1000);
+            nextState = CHAR_CLASS;
+            Serial.printf("PasswdSm next State: %s", classMenu[nextState]);
+            classMenuIndex = 0;
+          }
+          else
+          {
+
+          }
+        }
+        break;
+    }
+    return false;
+  }
+
+private:
+  PasswdStateName currentState;
+  PasswdStateName nextState;
+  CharClassName charClass;
+  char selectableChar;
+  char newPasswd[maxEpromStringLen];
+  int newPasswdIndex;
+  int classMenuIndex;
+  const int maxAlphaIndex = 25;
+  int alphaIndex;
+  const int maxNumberIndex = 9;
+  int numberIndex;
 };
 
 class FobSuperSm
 {
 public:
-  enum SuperStateName {WIFI_INIT, SYS_STATUS, SHUTDOWN, SSID, PASSWD, FACTORY}; // Superstate state names
+  enum SuperStateName {WIFI_INIT, SYS_STATUS, SHUTDOWN, LOCAL_REMOTE, SSID, PASSWD, FACTORY}; // Superstate state names
+  String stateNamesArray[7] = {"WIFI_INIT", "SYS_STATUS", "SHUTDOWN", "LOCAL_REMOTE", "SSID", "PASSWD", "FACTORY"};
 
   FobSuperSm()
   {
     currentState = WIFI_INIT;
     nextState = WIFI_INIT;
-  }
-
-  void buttonPress(ButtonName buttonName, PressType pressType)
-  {
-    bool rv;
-    Serial.printf("FobSuperSm button press name %d type %d in state %s\n"
-                  , buttonName, pressType, stateNamesArray[currentState].c_str());
-    switch (currentState)
-    {
-      case WIFI_INIT:
-        rv = wifiInitSm.buttonPress(buttonName, pressType);
-        if (rv)
-        {
-          nextState = SYS_STATUS;
-          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
-        }
-        break;
-      case SYS_STATUS:
-        rv = statusButton(buttonName, pressType);
-        Serial.printf("button push in FobSuperSm returned %d\n", rv);
-        if (rv)
-        {
-          nextState = SSID;
-          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
-        }
-        break;
-      case SHUTDOWN:
-        rv = shutdownSm.buttonPress(buttonName, pressType);
-        if (rv)
-        {
-          nextState = SYS_STATUS;
-          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
-        }
-        break;
-      case SSID:
-          nextState = SYS_STATUS;
-          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
-        break;
-      default:
-        nextState = SYS_STATUS;
-    }
   }
 
   void tick()
@@ -508,26 +712,168 @@ public:
       case SHUTDOWN:
         shutdownSm.tick();  // run the cancel timer
         break;
-      case SSID:
+      case LOCAL_REMOTE:
         M5.Lcd.fillScreen(BLACK);
         M5.Lcd.setCursor(0, 0, 2);
-        M5.Lcd.println("SSID: ");
+        M5.Lcd.printf("Mode: %s\n", configuredMode?"Remote":"Local");
+        M5.Lcd.println("M5-Long: change");
+        M5.Lcd.println("M5: set SSID");
+        break;
+      case SSID:
+        ssidSm.tick();
+        break;
+      case PASSWD:
+        M5.Lcd.fillScreen(BLACK);
+        M5.Lcd.setCursor(0, 0, 2);
+        M5.Lcd.println("PASSWD: ");
+        M5.Lcd.println("M5: Factory Reset");
+        break;
+      case FACTORY:
+        M5.Lcd.fillScreen(BLACK);
+        M5.Lcd.setCursor(0, 0, 2);
+        M5.Lcd.println("M5-Long: FACTORY RESET");
+        M5.Lcd.println("M5: Status");
         break;
       default:
         currentState = SYS_STATUS;
     }
   }
 
+  void buttonPress(ButtonName buttonName, PressType pressType)
+  {
+    bool rv;
+    Serial.printf("FobSuperSm button press name %d type %d in state %s\n"
+                  , buttonName, pressType, stateNamesArray[currentState].c_str());
+    switch (currentState)
+    {
+      case WIFI_INIT:
+        rv = wifiInitSm.buttonPress(buttonName, pressType);
+        if (rv)
+        {
+          nextState = SYS_STATUS;
+          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+        }
+        break;
+      case SYS_STATUS:
+        rv = statusButton(buttonName, pressType);
+        Serial.printf("button push in FobSuperSm returned %d\n", rv);
+        if (rv)
+        {
+          nextState = LOCAL_REMOTE;
+          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+        }
+        break;
+      case SHUTDOWN:
+        rv = shutdownSm.buttonPress(buttonName, pressType);
+        if (rv)
+        {
+          nextState = SYS_STATUS;
+          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+        }
+        break;
+      case LOCAL_REMOTE:
+        modeButton(buttonName, pressType);  // does not return from long press
+        nextState = SSID;
+        Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+        break;
+      case SSID:
+        rv = ssidSm.buttonPress(buttonName, pressType);
+        if (rv)
+        {
+          nextState = PASSWD;
+          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+        }
+        break;
+      case PASSWD:
+        nextState = FACTORY;
+        Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+        break;
+      case FACTORY:
+        factoryButton(buttonName, pressType);  // does not return from long press
+        nextState = SYS_STATUS;
+        Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+        break;
+      default:
+        nextState = SYS_STATUS;
+    }
+  }
+
+  void skipWifiInit()
+  {
+    nextState = SYS_STATUS;
+  }
+
 private:
   SuperStateName currentState;
   SuperStateName nextState;
-  String stateNamesArray[6] = {"WIFI_INIT", "SYS_STATUS", "SHUTDOWN", "SSID", "PASSWD", "FACTORY"};
 
   bool statusButton(ButtonName buttonName, PressType pressType);
 
   WifiInitSm wifiInitSm = WifiInitSm();
   ShutdownSm shutdownSm = ShutdownSm();
   SsidSm ssidSm = SsidSm();
+
+  void modeButton(ButtonName buttonName, PressType pressType)
+  {
+    Serial.printf("modeButton button press name %d type %d\n", buttonName, pressType);
+    if (BUTTON_B == buttonName)
+    {
+      Serial.println("Ignoring button B press");
+      return;
+    }
+    if (BUTTON_M5 == buttonName)
+    {
+      if (LONG_PRESS == pressType)
+      {
+        Serial.println("mode change button press");
+        M5.Lcd.fillScreen(BLACK);
+        M5.Lcd.setCursor(0, 0, 2);
+        M5.Lcd.println("MODE CHANGE");
+        delay(2000);
+        if (eepromConfig.configuredMode == LOCAL_MODE)
+        {
+          eepromConfig.configuredMode = REMOTE_MODE;
+        }
+        else
+        {
+          eepromConfig.configuredMode = LOCAL_MODE;
+        }
+        writeEepromConfig();  // does not return
+      }
+    }
+    return;
+  }
+
+  void factoryButton(ButtonName buttonName, PressType pressType)
+  {
+    Serial.printf("factoryButton button press name %d type %d\n", buttonName, pressType);
+    if (BUTTON_B == buttonName)
+    {
+      Serial.println("Ignoring button B press");
+      return;
+    }
+    if (BUTTON_M5 == buttonName)
+    {
+      if (LONG_PRESS == pressType)
+      {
+        Serial.println("Factory reset button press");
+        M5.Lcd.fillScreen(BLACK);
+        M5.Lcd.setCursor(0, 0, 2);
+        M5.Lcd.println("FACTORY RESET");
+        eepromConfig.magic = (uint16_t)0xbeef;
+        eepromConfig.version = 1;
+        eepromConfig.configuredMode = LOCAL_MODE;
+        strcpy(eepromConfig.configuredLocalSsid, "No local SSID");
+        strcpy(eepromConfig.localPasswd, "No local passwd");
+        strcpy(eepromConfig.configuredRemoteSsid, "No remote SSID");
+        strcpy(eepromConfig.remotePasswd, "No remote passwd");
+
+        writeEepromConfig();  // does not return
+      }
+    }
+    return;
+  }
+
 };
 
 //! @return true: advance super SM, false: no state change
@@ -563,6 +909,14 @@ FobSuperSm::statusButton(ButtonName buttonName, PressType pressType)
 
 FobSuperSm fobSuperSm = FobSuperSm();
 
+void printEeprom()
+{
+  Serial.printf("0x%x %d %d\n", eepromConfig.magic, eepromConfig.version, eepromConfig.configuredMode);
+  Serial.println(eepromConfig.configuredLocalSsid);
+  Serial.println(eepromConfig.localPasswd);
+  Serial.println(eepromConfig.configuredRemoteSsid);
+  Serial.println(eepromConfig.remotePasswd);
+}
 
 void setup() {
   // initialize M5StickC
@@ -576,36 +930,55 @@ void setup() {
 
   Serial.begin(115200);
 
+  // initialize time
+  int64_t now = esp_timer_get_time();
+  nextSecondTime = now + 1000000;  // time to increment the seconds counter
+
   // Set WiFi to station mode and disconnect from an AP if it was previously connected.
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   delay(100);
 
   // Initialize EEPROM
-  while (!EEPROM.begin(EEPROM_SIZE)) {  // Request storage of SIZE size(success return)
-    Serial.println("\nFailed to initialise EEPROM!");
-    M5.Lcd.println("EEPROM Fail");
-    delay(1000000);
+  if (!EEPROM.begin(sizeof(EepromConfig))) {  // Request storage of SIZE size(success return)
+    Serial.println("\nFailed to initialize EEPROM!");
+    M5.Lcd.println("EEPROM Fail\nFactory Reset needed");
+    delay(30000);
+    fobSuperSm.skipWifiInit();
+    return;
   }
 
   // Initialize variables from EEPROM
-  localMode = EEPROM.read(SSID_ADDR);
-  if (localMode == 0)
+  uint8_t * eepromConfig_p = (uint8_t*)&eepromConfig;
+  for (int i=0; i<sizeof(EepromConfig); i++)
   {
-    strncpy(configuredSSID, WIFI_REMOTE_SSID, maxSSIDLen);
-    strncpy(configuredSSIDPwd, WIFI_REMOTE_PASSWORD, maxSSIDLen);
+    *(eepromConfig_p + i) = EEPROM.read(i);  // read the EEPROM
+  }
+
+  printEeprom();
+
+  if (eepromConfig.magic != magicValue)
+  {
+    Serial.println("\nEEPROM not initialized!");
+    M5.Lcd.println("EEPROM invalid\nFactory Reset needed");
+    delay(30000);
+    fobSuperSm.skipWifiInit();
+    return;
+  }
+
+  configuredMode = eepromConfig.configuredMode;
+  if (LOCAL_MODE == configuredMode)
+  {
+    strncpy(configuredSSID, eepromConfig.configuredLocalSsid, maxEpromStringLen);
+    strncpy(configuredSSIDPwd, eepromConfig.localPasswd, maxEpromStringLen);
   }
   else
   {
-    strncpy(configuredSSID, WIFI_LOCAL_SSID, maxSSIDLen);
-    strncpy(configuredSSIDPwd, WIFI_LOCAL_PASSWORD, maxSSIDLen);
+    strncpy(configuredSSID, eepromConfig.configuredRemoteSsid, maxEpromStringLen);
+    strncpy(configuredSSIDPwd, eepromConfig.remotePasswd, maxEpromStringLen);
   }
 
-  Serial.printf("configured SSID index: %d SSID: %s\n", localMode, configuredSSID);
-
-  // initialize time
-  int64_t now = esp_timer_get_time();
-  nextSecondTime = now + 1000000;  // time to increment the seconds counter
+  Serial.printf("configuredMode: %d SSID: %s\n", configuredMode, configuredSSID);
 }
 
 void loop() {
@@ -632,6 +1005,7 @@ void loop() {
       fobSuperSm.buttonPress(BUTTON_M5, LONG_PRESS);
     }
   }
+
   if (M5.BtnA.wasReleased())
   {
     buttonA = false;
@@ -660,7 +1034,7 @@ void loop() {
   if (now_us > nextSecondTime)
   {
     secondsSinceStart++;
-    nextSecondTime += 1000000;
+    nextSecondTime = now_us + 1000000;
     // Serial.printf("%lld toggleTime: %d state %d\n", secondsSinceStart, nextFlowToggleTime, generateFlowPulses);
     secondsUpdate();
     fobSuperSm.tick();
