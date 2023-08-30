@@ -217,7 +217,6 @@ public:
   bool tick()
   {
     currentState = nextState;
-    Serial.printf("In WifiInitSm state %s\n", stateNamesArray[currentState]);
     M5.Lcd.fillScreen(BLACK);
     M5.Lcd.setCursor(0, 0, 2);
     M5.Lcd.println(stateNamesArray[currentState]);
@@ -562,19 +561,14 @@ class PasswdSm
 public:
   enum PasswdStateName {IDLE, CHAR_CLASS, SELECT_CHAR};  // SSID choice state names
   String stateNamesArray[3] = {"IDLE", "CHAR_CLASS", "SELECT_CHAR"};
-  enum CharClassName {LOWER, UPPER, NUMBER, SAVE, BACKSPACE};
-  const String classMenu[5] = {"lower", "UPPER", "number", "<Save>", "<Backspace>"};
+  enum CharClassName {LOWER, UPPER, NUMBER, SAVE, BACKSPACE, CHAR_CLASS_END};  // add items before CHAR_CLASS_END
+  const String classMenu[CHAR_CLASS_END] = {"lower", "UPPER", "number", "<Save>", "<Backspace>"};
 
   PasswdSm()
   {
     currentState = IDLE;
     nextState = IDLE;
     charClass = LOWER;
-    newPasswdIndex = 0;
-    alphaIndex = 0;
-    numberIndex = 0;
-    for (int i=0; i<maxEpromStringLen; i++)
-      newPasswd[i] = 0;
   }
 
   void tick()
@@ -586,13 +580,13 @@ public:
     switch(currentState)
     {
       case IDLE:
-        M5.Lcd.printf("Password: %s\n",configuredSSIDPwd);
+        M5.Lcd.printf("Password: %s\n", configuredSSIDPwd);
         M5.Lcd.println("M5-long: Change\nM5: Factory Reset");
         break;
       case CHAR_CLASS:
         M5.Lcd.printf("Password: %s\n", newPasswd);
-        M5.Lcd.printf("M5-long - select char type:\n%s\n",classMenu[classMenuIndex].c_str());
-        M5.Lcd.println("M5: next char type");
+        M5.Lcd.printf("M5-long - select:\n%s\n",classMenu[classMenuIndex].c_str());
+        M5.Lcd.println("M5: next type");
         break;
       case SELECT_CHAR:
         switch (charClass)
@@ -610,7 +604,7 @@ public:
             alphaIndex = 0;
             numberIndex = 0;
         }
-        M5.Lcd.printf("Password: %s\n",configuredSSIDPwd);
+        M5.Lcd.printf("Password: %s\n", newPasswd);
         M5.Lcd.printf("M5-long - select char: %c\n",selectableChar);
         M5.Lcd.println("M5: next char");
         break;
@@ -623,11 +617,12 @@ public:
   //! @return true: advance super SM, false: no state change
   bool buttonPress(ButtonName buttonName, PressType pressType)
   {
+    if (BUTTON_B == buttonName)
+      return true;  // exit Sm on button B
+
     switch (currentState)
     {
       case IDLE:
-        if (BUTTON_B == buttonName)
-          return true;  // exit Sm on button B
         if (BUTTON_M5 == buttonName)
         {
           if (LONG_PRESS == pressType)
@@ -636,16 +631,102 @@ public:
             M5.Lcd.setCursor(0, 0, 2);
             M5.Lcd.println("CHANGE PASSWORD");
             delay(1000);
+
             nextState = CHAR_CLASS;
-            Serial.printf("PasswdSm next State: %s", classMenu[nextState]);
+            Serial.printf("PasswdSm next State: %s\n", stateNamesArray[nextState]);
+
             classMenuIndex = 0;
+            newPasswdIndex = 0;
+            alphaIndex = 0;
+            numberIndex = 0;
+            for (int i=0; i<maxEpromStringLen; i++)
+              newPasswd[i] = 0;
           }
           else
           {
-
+            return true;
           }
         }
         break;
+      case CHAR_CLASS:
+        if (BUTTON_M5 == buttonName)
+        {
+          if (LONG_PRESS == pressType)
+          {
+            M5.Lcd.fillScreen(BLACK);
+            M5.Lcd.setCursor(0, 0, 2);
+            switch (charClass)
+            {
+              case LOWER:
+              case UPPER:
+              case NUMBER:
+                M5.Lcd.println("SELECT CHARACTER");
+                delay(1000);
+                nextState = SELECT_CHAR;
+                Serial.printf("PasswdSm next State: %s\n", stateNamesArray[nextState]);
+                break;
+              case SAVE:
+                M5.Lcd.println("SAVE - REBOOTING");
+                if (configuredMode == LOCAL_MODE)
+                  strncpy(eepromConfig.localPasswd, newPasswd, maxEpromStringLen);
+                else
+                  strncpy(eepromConfig.remotePasswd, newPasswd, maxEpromStringLen);
+                writeEepromConfig();  // Does not return
+                break;  // never reached
+              case BACKSPACE:
+                M5.Lcd.println("BACKSPACE-ERASE");
+                --newPasswdIndex;
+                newPasswd[newPasswdIndex] = 0;
+                break;
+            }
+          }
+          else
+          {
+            ++classMenuIndex;
+            if (classMenuIndex == CHAR_CLASS_END)
+              classMenuIndex = 0;
+            charClass = (CharClassName)classMenuIndex;
+            Serial.printf("classMenuIndex: %d\n", classMenuIndex);
+          }
+        }
+        break;
+      case SELECT_CHAR:
+        if (BUTTON_M5 == buttonName)
+        {
+          if (LONG_PRESS == pressType)
+          {
+            newPasswd[newPasswdIndex++] = selectableChar;
+
+            M5.Lcd.fillScreen(BLACK);
+            M5.Lcd.setCursor(0, 0, 2);
+            M5.Lcd.printf("SELECTED %c\n", selectableChar);
+            Serial.printf("SELECTED character %c\n", selectableChar);
+            delay(1000);
+
+            nextState = CHAR_CLASS;
+            Serial.printf("PasswdSm next State: %s\n", stateNamesArray[nextState]);
+          }
+          else
+          {
+            switch(charClass)
+            {
+              case LOWER:
+              case UPPER:
+                ++alphaIndex;
+                if (alphaIndex == 26)
+                  alphaIndex = 0;
+                break;
+              case NUMBER:
+                ++numberIndex;
+                if (numberIndex == 10)
+                  numberIndex = 0;
+                break;
+            }
+          }
+        }
+        break;
+      default:
+        nextState = IDLE;
     }
     return false;
   }
@@ -723,10 +804,7 @@ public:
         ssidSm.tick();
         break;
       case PASSWD:
-        M5.Lcd.fillScreen(BLACK);
-        M5.Lcd.setCursor(0, 0, 2);
-        M5.Lcd.println("PASSWD: ");
-        M5.Lcd.println("M5: Factory Reset");
+        passwdSm.tick();
         break;
       case FACTORY:
         M5.Lcd.fillScreen(BLACK);
@@ -785,8 +863,12 @@ public:
         }
         break;
       case PASSWD:
-        nextState = FACTORY;
-        Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+        rv = passwdSm.buttonPress(buttonName, pressType);
+        if (rv)
+        {
+          nextState = FACTORY;
+          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+        }
         break;
       case FACTORY:
         factoryButton(buttonName, pressType);  // does not return from long press
@@ -812,6 +894,7 @@ private:
   WifiInitSm wifiInitSm = WifiInitSm();
   ShutdownSm shutdownSm = ShutdownSm();
   SsidSm ssidSm = SsidSm();
+  PasswdSm passwdSm = PasswdSm();
 
   void modeButton(ButtonName buttonName, PressType pressType)
   {
@@ -863,10 +946,10 @@ private:
         eepromConfig.magic = (uint16_t)0xbeef;
         eepromConfig.version = 1;
         eepromConfig.configuredMode = LOCAL_MODE;
-        strcpy(eepromConfig.configuredLocalSsid, "No local SSID");
-        strcpy(eepromConfig.localPasswd, "No local passwd");
-        strcpy(eepromConfig.configuredRemoteSsid, "No remote SSID");
-        strcpy(eepromConfig.remotePasswd, "No remote passwd");
+        strcpy(eepromConfig.configuredLocalSsid, "No SSID");
+        strcpy(eepromConfig.localPasswd, "None");
+        strcpy(eepromConfig.configuredRemoteSsid, "No SSID");
+        strcpy(eepromConfig.remotePasswd, "None");
 
         writeEepromConfig();  // does not return
       }
