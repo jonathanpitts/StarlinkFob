@@ -1,5 +1,4 @@
 #include <M5StickCPlus.h>
-#include "secrets.h"
 #include "WiFi.h"
 #include "AsyncUDP.h"
 #include <string>
