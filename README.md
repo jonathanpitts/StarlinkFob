@@ -12,9 +12,8 @@ https://sites.google.com/site/paulbouchier/home/projects/starlink
 
 ## Wifi passwords
 
-This repo contains a file: secrets.template.h. Follow the instructions in that file to set
-your SSID and Wifi password, and rename it to secrets.h to enable building the project in
-the Arduino environment.
+The software has a menuing system which lets you select an SSID to connect to, and allows setting the
+wifi password in the manner of setting date/time on a watch.
 
 ## Build
 
