@@ -1,4 +1,12 @@
+// comment out the following line to build for M5StickCPlus2
+#define M5STICKC_PLUS
+
+#ifdef M5STICKC_PLUS
 #include <M5StickCPlus.h>
+#else
+#include <M5StickCPlus2.h>
+#endif
+
 #include "WiFi.h"
 #include "AsyncUDP.h"
 #include <string>

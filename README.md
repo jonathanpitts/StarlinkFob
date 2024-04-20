@@ -19,6 +19,13 @@ wifi password in the manner of setting date/time on a watch.
 
 ### Prerequisites
 
-You must have the following libraries installed in your Arduino environment:
-- M5Stack board support
-- 
+You must have the M5Stack board support installed in your Arduino environment - follow
+these instructions: https://docs.m5stack.com/en/arduino/arduino_ide
+
+Install required libraries using these instructions: https://roboticsbackend.com/install-arduino-library-from-github/
+
+Required libraries:
+- ESP32Ping library from  https://github.com/marian-craciunescu/ESP32Ping
+- M5StickCPlus from https://github.com/m5stack/M5StickC-Plus
+- M5StickCPlus2 from https://github.com/m5stack/M5StickCPlus2
+
