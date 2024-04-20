@@ -1,4 +1,4 @@
-#include <M5StickCPlus.h>
+#include <M5StickCPlus2.h>
 #include "WiFi.h"
 #include "AsyncUDP.h"
 #include <string>
@@ -56,7 +56,7 @@ std::vector<String> ssidNames;
 IPAddress linkyM5IP(192, 168, 8, 10);
 IPAddress linkyIP(192, 168, 100, 1);
 IPAddress linkyRouterIP(192, 168, 8, 1);
-IPAddress rvRouterIP(192, 168, 12, 1);
+IPAddress rvRouterIP(192, 168, 1, 254);
 IPAddress subnet(255, 255, 255, 0);
 IPAddress primaryDNS(8, 8, 8, 8);   // optional
 IPAddress secondaryDNS(8, 8, 4, 4); // optional
@@ -69,7 +69,7 @@ struct PingTarget {
   bool pinged;  // Have sent a ping to this host
   bool pingOK;  // result of ping
 };
-PingTarget rvRouter = {.displayHostname="rvRouter", .useIP=true, .pingIP=rvRouterIP, .pinged=false, .pingOK=false};
+PingTarget rvRouter = {.displayHostname="Router", .useIP=true, .pingIP=rvRouterIP, .pinged=false, .pingOK=false};
 PingTarget linkyRouter = {.displayHostname="linkyRouter", .useIP=true, .pingIP=linkyRouterIP, .pinged=false, .pingOK=false};
 PingTarget linkyM5 = {.displayHostname="linkyM5stick", .useIP=true, .pingIP=linkyM5IP, .pinged=false, .pingOK=false};
 PingTarget linky = {.displayHostname="linky", .useIP=true, .pingIP=linkyIP, .pinged=false, .pingOK=false};
@@ -218,7 +218,7 @@ public:
     currentState = nextState;
     M5.Lcd.fillScreen(BLACK);
     M5.Lcd.setCursor(0, 0, 2);
-    M5.Lcd.println(stateNamesArray[currentState]);
+    M5.Lcd.println("1SimpleConnect\n469-257-1111\n" + stateNamesArray[currentState]);
 
     switch(currentState)
     {
@@ -397,7 +397,7 @@ public:
         else
         {
           Serial.println("Shutdown after timeout");
-          M5.Axp.PowerOff();
+          StickCP2.Power.powerOff();
           // never reached
         }
         break;
