@@ -1,5 +1,6 @@
 #include <M5StickCPlus2.h>
 #include "WiFi.h"
+#include "secrets.h"
 #include "AsyncUDP.h"
 #include <string>
 #include <EEPROM.h>
@@ -164,7 +165,8 @@ void displayStatus()
 {
   M5.Lcd.setCursor(0, 0, 2);
   M5.Lcd.print(statusMsg);
-
+  //M5.Lcd.setCursor(0, 60, 2);
+  //M5.Lcd.print("USB:\r\n  V: %.3fv  I: %.3fma\r\n", M5.Axp.GetVBusVoltage(),M5.Axp.GetVBusCurrent());
   // display ping status of current ping target
   M5.Lcd.setCursor(0, 80, 2);
   if (wifiSetupComplete)
@@ -386,6 +388,8 @@ public:
         }
         break;
       case TIMEOUT:
+
+
         M5.Lcd.fillScreen(BLACK);
         M5.Lcd.setCursor(0, 0, 2);
         M5.Lcd.println("Shutting Down!!!\nPress M5 button\nto cancel");
@@ -1007,6 +1011,8 @@ void setup() {
   M5.Lcd.setTextSize(2);
   M5.Lcd.setTextColor(TFT_RED,TFT_BLACK);
   M5.update();
+  //Added to track if on battery or not
+  //M5.Axp.EnableCoulombcounter(); 
 
   sprintf(statusMsg, "starting");
 
@@ -1042,10 +1048,20 @@ void setup() {
   if (eepromConfig.magic != magicValue)
   {
     Serial.println("\nEEPROM not initialized!");
-    M5.Lcd.println("EEPROM invalid\nFactory Reset needed");
-    delay(30000);
-    fobSuperSm.skipWifiInit();
-    return;
+    M5.Lcd.println("EEPROM invalid\nSetting Defaults");
+    eepromConfig.magic = (uint16_t)0xbeef;
+    eepromConfig.version = 1;
+    eepromConfig.configuredMode = LOCAL_MODE;
+
+    strncpy(eepromConfig.configuredLocalSsid, WIFI_SSID, maxEpromStringLen);
+    strncpy(eepromConfig.localPasswd, WIFI_PASSWORD, maxEpromStringLen);
+    strncpy(eepromConfig.configuredRemoteSsid, WIFI_SSID, maxEpromStringLen);
+    strncpy(eepromConfig.remotePasswd, WIFI_PASSWORD, maxEpromStringLen);
+    delay(10000);
+    writeEepromConfig();  // Does not return
+    //delay(30000);
+    //fobSuperSm.skipWifiInit();
+    return; // never reached
   }
 
   configuredMode = eepromConfig.configuredMode;
